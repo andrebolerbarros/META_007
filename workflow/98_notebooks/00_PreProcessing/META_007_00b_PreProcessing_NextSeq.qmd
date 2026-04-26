@@ -1,0 +1,238 @@
+---
+title: "META_007 - 16S Amplicon PreProcessing (NextSeq)"
+author: "Genomics Platform"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+editor: visual
+execute:
+  warning: false
+  message: false
+---
+
+# Overview
+
+PreProcessing of 16S rRNA amplicon sequencing data generated on **Illumina NextSeq**, as part of the META_007 platform comparison (MiSeq vs NextSeq).
+
+The workflow follows the standard `DADA2` pipeline up to taxonomic classification. Because NextSeq produces **binned quality scores**, the error model is run twice and saved into two separate phyloseq objects:
+
+1. **Standard** error model (`learnErrors` defaults).
+2. **Custom binned** error model, using the DADA2-recommended `loessErrfun` modification for binned Q-scores.
+
+The Q20-based truncation step used for MiSeq is **not** applied here.
+
+# 1. Setup
+
+```{r libraries}
+library(dada2)
+library(phyloseq)
+library(Biostrings)
+library(ggplot2)
+library(here)
+```
+
+```{r paths}
+path_raw      <- here("data", "01_raw", "NextSeq")
+path_filt     <- here("data", "02_filtered", "NextSeq")
+path_phyloseq <- here("data", "02_phyloseq")
+path_tax      <- here("data", "98_miscellaneous", "silva")
+
+dir.create(path_filt, recursive = TRUE, showWarnings = FALSE)
+dir.create(path_phyloseq, recursive = TRUE, showWarnings = FALSE)
+
+fnFs <- sort(list.files(path_raw, pattern = "_R1_001.fastq.gz", full.names = TRUE))
+fnRs <- sort(list.files(path_raw, pattern = "_R2_001.fastq.gz", full.names = TRUE))
+
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+sample.names
+```
+
+# 2. Quality Profiles
+
+```{r qc-plots}
+plotQualityProfile(fnFs[1:min(4, length(fnFs))]) + ggtitle("Forward — first samples")
+plotQualityProfile(fnRs[1:min(4, length(fnRs))]) + ggtitle("Reverse — first samples")
+```
+
+# 3. Filter and Trim
+
+Default truncation values appropriate for V3-V4 / NextSeq 2x150 or 2x300; adjust as needed for the actual run.
+
+```{r filter-trim}
+filtFs <- file.path(path_filt, paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path_filt, paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+truncLen_F <- 150
+truncLen_R <- 150
+
+out <- filterAndTrim(
+  fnFs, filtFs, fnRs, filtRs,
+  truncLen = c(truncLen_F, truncLen_R),
+  maxN = 0, maxEE = c(2, 2), truncQ = 2, rm.phix = TRUE,
+  compress = TRUE, multithread = TRUE
+)
+head(out)
+```
+
+# 4. Learn Errors — two strategies
+
+## 4.1 Standard `learnErrors`
+
+```{r learn-errors-standard}
+errF_std <- learnErrors(filtFs, multithread = TRUE)
+errR_std <- learnErrors(filtRs, multithread = TRUE)
+
+plotErrors(errF_std, nominalQ = TRUE)
+plotErrors(errR_std, nominalQ = TRUE)
+```
+
+## 4.2 Custom error model for binned quality scores
+
+NextSeq emits a small set of binned Q-scores (e.g. 2, 11, 25, 37). The standard
+`loessErrfun` can produce poorly-fit transitions at intermediate Q-values, so we
+use the DADA2-recommended modification (monotonic enforcement + weighted loess
+across observed Q-bins).
+
+Reference: <https://github.com/benjjneb/dada2/issues/1307>
+
+```{r loess-binned}
+loessErrfun_mod <- function(trans) {
+  qq <- as.numeric(colnames(trans))
+  est <- matrix(0, nrow = 0, ncol = length(qq))
+  for (nti in c("A", "C", "G", "T")) {
+    for (ntj in c("A", "C", "G", "T")) {
+      if (nti != ntj) {
+        errs <- trans[paste0(nti, "2", ntj), ]
+        tot  <- colSums(trans[paste0(nti, "2", c("A", "C", "G", "T")), ])
+        rlogp <- log10((errs + 1) / tot)
+        df <- data.frame(q = qq, errs = errs, tot = tot, rlogp = rlogp)
+
+        # Weighted loess; enforce monotonic decrease in error rate with Q
+        mod.lo <- loess(rlogp ~ q, data = df, weights = log10(tot),
+                        span = 2, degree = 1)
+        pred <- predict(mod.lo, qq)
+        # Fill any NAs at extremes
+        if (any(is.na(pred))) {
+          pred[is.na(pred) & qq < min(qq[!is.na(pred)])] <-
+            pred[!is.na(pred)][1]
+          pred[is.na(pred) & qq > max(qq[!is.na(pred)])] <-
+            tail(pred[!is.na(pred)], 1)
+        }
+        # Force monotonic non-increasing
+        for (i in 2:length(pred)) {
+          if (pred[i] > pred[i - 1]) pred[i] <- pred[i - 1]
+        }
+        est <- rbind(est, 10^pred)
+      } else {
+        est <- rbind(est, rep(NA_real_, length(qq)))
+      }
+    }
+  }
+  err <- est
+  rownames(err) <- paste0(rep(c("A", "C", "G", "T"), each = 4), "2",
+                          rep(c("A", "C", "G", "T"), times = 4))
+  colnames(err) <- colnames(trans)
+  # Self-transitions = 1 - sum(off-diagonals) per Q
+  for (nt in c("A", "C", "G", "T")) {
+    others <- paste0(nt, "2", setdiff(c("A", "C", "G", "T"), nt))
+    err[paste0(nt, "2", nt), ] <- 1 - colSums(err[others, ])
+  }
+  err
+}
+
+errF_bin <- learnErrors(filtFs, multithread = TRUE,
+                        errorEstimationFunction = loessErrfun_mod,
+                        verbose = TRUE)
+errR_bin <- learnErrors(filtRs, multithread = TRUE,
+                        errorEstimationFunction = loessErrfun_mod,
+                        verbose = TRUE)
+
+plotErrors(errF_bin, nominalQ = TRUE)
+plotErrors(errR_bin, nominalQ = TRUE)
+```
+
+# 5. Helper: full DADA2 → phyloseq pipeline given an error model
+
+```{r helper-pipeline}
+run_dada_pipeline <- function(errF, errR, label) {
+  dadaFs <- dada(filtFs, err = errF, multithread = TRUE)
+  dadaRs <- dada(filtRs, err = errR, multithread = TRUE)
+
+  mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose = TRUE)
+  seqtab  <- makeSequenceTable(mergers)
+  seqtab.nochim <- removeBimeraDenovo(seqtab, method = "consensus",
+                                      multithread = TRUE, verbose = TRUE)
+
+  getN <- function(x) sum(getUniques(x))
+  track <- cbind(out,
+                 sapply(dadaFs, getN), sapply(dadaRs, getN),
+                 sapply(mergers, getN), rowSums(seqtab.nochim))
+  colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR",
+                       "merged", "nonchim")
+  rownames(track) <- sample.names
+  print(track)
+
+  taxa <- assignTaxonomy(
+    seqtab.nochim,
+    file.path(path_tax, "silva_nr99_v138.1_train_set.fa.gz"),
+    multithread = TRUE
+  )
+  taxa <- addSpecies(
+    taxa,
+    file.path(path_tax, "silva_species_assignment_v138.1.fa.gz")
+  )
+
+  otu <- otu_table(seqtab.nochim, taxa_are_rows = FALSE)
+  tax <- tax_table(taxa)
+  sam <- sample_data(data.frame(SampleID  = sample.names,
+                                Platform  = "NextSeq",
+                                ErrorMod  = label,
+                                row.names = sample.names))
+  ps <- phyloseq(otu, tax, sam)
+
+  dna <- DNAStringSet(taxa_names(ps))
+  names(dna) <- taxa_names(ps)
+  ps <- merge_phyloseq(ps, dna)
+  taxa_names(ps) <- paste0("ASV", seq(ntaxa(ps)))
+
+  ps
+}
+```
+
+# 6. Run pipeline with each error model
+
+## 6.1 Standard
+
+```{r run-standard}
+ps_std <- run_dada_pipeline(errF_std, errR_std, label = "standard")
+ps_std
+```
+
+## 6.2 Custom binned
+
+```{r run-binned}
+ps_bin <- run_dada_pipeline(errF_bin, errR_bin, label = "CustomBinned_DADA2")
+ps_bin
+```
+
+# 7. Save phyloseq Objects
+
+```{r save-rds}
+saveRDS(ps_std,
+        file = file.path(path_phyloseq, "META_007_NextSeq_standard.rds"))
+saveRDS(ps_bin,
+        file = file.path(path_phyloseq,
+                         "META_007_NextSeq_CustomBinned_DADA2.rds"))
+```
+
+# Session Info
+
+```{r session}
+sessionInfo()
+```

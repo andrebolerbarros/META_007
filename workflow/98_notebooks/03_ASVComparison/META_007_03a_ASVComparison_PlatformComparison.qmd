@@ -1,0 +1,376 @@
+---
+title: "META_007 - ASV-level Comparison: MiSeq vs NextSeq"
+author: "Genomics Platform"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+editor: visual
+execute:
+  warning: false
+  message: false
+---
+
+# Overview
+
+ASV-level comparison of the three phyloseq objects from `00_PreProcessing`:
+
+- `META_007_Miseq.rds` — MiSeq, standard DADA2
+- `META_007_NextSeq_standard.rds` — NextSeq, standard `learnErrors`
+- `META_007_NextSeq_CustomBinned_DADA2.rds` — NextSeq, custom binned-Q `loessErrfun`
+
+We compare:
+
+1. **Counts & sizes** — number of ASVs, sequence length distributions, abundance distributions per dataset.
+2. **Exact-sequence overlap** — ASVs whose sequences are identical across datasets (Venn / UpSet).
+3. **Alignment-based overlap** — for ASVs that *don't* match exactly, use pairwise alignment to detect ASVs that differ only by a few mismatches (e.g. ≥ 99 % identity), which can happen due to platform-specific error patterns or read-length differences.
+
+# 1. Setup
+
+```{r libraries}
+library(phyloseq)
+library(Biostrings)
+library(DECIPHER)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(here)
+library(patchwork)
+library(UpSetR)
+```
+
+```{r paths}
+path_phyloseq <- here("data", "02_phyloseq")
+path_results  <- here("data", "05_asv_comparison")
+dir.create(path_results, recursive = TRUE, showWarnings = FALSE)
+```
+
+# 2. Load Objects
+
+```{r load}
+ps_miseq  <- readRDS(file.path(path_phyloseq, "META_007_Miseq.rds"))
+ps_ns_std <- readRDS(file.path(path_phyloseq, "META_007_NextSeq_standard.rds"))
+ps_ns_bin <- readRDS(file.path(path_phyloseq,
+                               "META_007_NextSeq_CustomBinned_DADA2.rds"))
+
+ps_list <- list(
+  MiSeq                = ps_miseq,
+  NextSeq_standard     = ps_ns_std,
+  NextSeq_CustomBinned = ps_ns_bin
+)
+```
+
+# 3. Build a Per-ASV Master Table
+
+```{r asv-table}
+build_asv_df <- function(ps, dataset) {
+  seqs <- refseq(ps)
+  if (is.null(seqs)) {
+    seqs <- DNAStringSet(taxa_names(ps))
+    names(seqs) <- taxa_names(ps)
+  }
+  otu <- as(otu_table(ps), "matrix")
+  if (!taxa_are_rows(ps)) otu <- t(otu)
+
+  data.frame(
+    Dataset      = dataset,
+    ASV_ID       = taxa_names(ps),
+    Sequence     = as.character(seqs[taxa_names(ps)]),
+    Length       = width(seqs[taxa_names(ps)]),
+    TotalCount   = rowSums(otu),
+    Prevalence   = rowSums(otu > 0),
+    NumSamples   = ncol(otu),
+    stringsAsFactors = FALSE
+  )
+}
+
+asv_df <- bind_rows(lapply(names(ps_list),
+                           function(n) build_asv_df(ps_list[[n]], n)))
+
+asv_df <- asv_df %>%
+  group_by(Dataset) %>%
+  mutate(RelAbund = TotalCount / sum(TotalCount),
+         PrevalenceFrac = Prevalence / NumSamples) %>%
+  ungroup()
+
+write.csv(asv_df %>% select(-Sequence),
+          file.path(path_results, "META_007_asv_summary.csv"),
+          row.names = FALSE)
+
+head(asv_df %>% select(-Sequence))
+```
+
+# 4. Counts and Size Distributions
+
+## 4.1 Number of ASVs per dataset
+
+```{r asv-counts, fig.width=6, fig.height=4}
+asv_df %>%
+  count(Dataset, name = "n_ASV") %>%
+  ggplot(aes(Dataset, n_ASV, fill = Dataset)) +
+  geom_col(width = 0.6, alpha = 0.85) +
+  geom_text(aes(label = n_ASV), vjust = -0.4) +
+  theme_bw() + theme(legend.position = "none") +
+  labs(title = "Number of ASVs per dataset", y = "# ASVs", x = NULL)
+```
+
+## 4.2 Sequence length distribution
+
+```{r asv-lengths, fig.width=10, fig.height=4}
+p1 <- ggplot(asv_df, aes(Length, fill = Dataset)) +
+  geom_histogram(binwidth = 1, alpha = 0.7, position = "identity") +
+  facet_wrap(~ Dataset, scales = "free_y") +
+  theme_bw() + theme(legend.position = "none") +
+  labs(title = "ASV sequence length distribution", x = "Length (bp)", y = "Count")
+
+p2 <- ggplot(asv_df, aes(Dataset, Length, fill = Dataset)) +
+  geom_violin(alpha = 0.6) + geom_boxplot(width = 0.15, outlier.size = 0.6) +
+  theme_bw() + theme(legend.position = "none") +
+  labs(title = "Length per dataset", x = NULL, y = "Length (bp)")
+
+p1 | p2
+```
+
+## 4.3 Abundance and prevalence distributions
+
+```{r asv-abund-prev, fig.width=10, fig.height=4}
+p1 <- ggplot(asv_df, aes(TotalCount + 1, fill = Dataset)) +
+  geom_density(alpha = 0.4) + scale_x_log10() +
+  theme_bw() +
+  labs(title = "Per-ASV total count (log10)", x = "Total count + 1", y = "Density")
+
+p2 <- ggplot(asv_df, aes(PrevalenceFrac, fill = Dataset)) +
+  geom_density(alpha = 0.4) +
+  theme_bw() +
+  labs(title = "Per-ASV prevalence", x = "Fraction of samples", y = "Density")
+
+p1 | p2
+```
+
+# 5. Exact-Sequence Overlap
+
+ASVs are identical iff their sequences are identical strings. NextSeq reads are
+typically shorter than MiSeq, so we **also** evaluate overlap on a common
+prefix length (= shortest median read length) to avoid penalising trivial
+length differences.
+
+## 5.1 Full-sequence overlap
+
+```{r exact-full, fig.width=7, fig.height=5}
+seq_sets <- split(asv_df$Sequence, asv_df$Dataset)
+
+upset_input <- fromList(seq_sets)
+upset(upset_input, order.by = "freq", nsets = 3,
+      mainbar.y.label = "ASV sequences (full length)",
+      sets.x.label = "ASVs per dataset")
+```
+
+## 5.2 Common-prefix overlap
+
+```{r exact-prefix, fig.width=7, fig.height=5}
+common_len <- min(asv_df %>% group_by(Dataset) %>%
+                    summarise(m = median(Length)) %>% pull(m))
+common_len <- as.integer(common_len)
+cat("Common prefix length used:", common_len, "bp\n")
+
+seq_prefix <- split(substr(asv_df$Sequence, 1, common_len), asv_df$Dataset)
+upset(fromList(seq_prefix), order.by = "freq", nsets = 3,
+      mainbar.y.label = paste0("ASV prefixes (", common_len, " bp)"),
+      sets.x.label = "ASVs per dataset")
+```
+
+```{r exact-overlap-table}
+overlap_summary <- function(sets) {
+  pairs <- combn(names(sets), 2, simplify = FALSE)
+  do.call(rbind, lapply(pairs, function(pr) {
+    a <- unique(sets[[pr[1]]]); b <- unique(sets[[pr[2]]])
+    data.frame(A = pr[1], B = pr[2],
+               n_A = length(a), n_B = length(b),
+               shared = length(intersect(a, b)),
+               jaccard = length(intersect(a, b)) /
+                         length(union(a, b)))
+  }))
+}
+
+ov_full   <- overlap_summary(seq_sets)   %>% mutate(mode = "full")
+ov_prefix <- overlap_summary(seq_prefix) %>% mutate(mode = paste0("prefix_", common_len))
+overlap_tbl <- bind_rows(ov_full, ov_prefix)
+write.csv(overlap_tbl,
+          file.path(path_results, "META_007_exact_overlap.csv"),
+          row.names = FALSE)
+overlap_tbl
+```
+
+# 6. Alignment-Based Overlap
+
+For ASVs that don't match exactly, perform pairwise alignment between datasets
+to detect near-identical sequences. We use `DECIPHER::AlignSeqs` to build a
+multiple alignment per dataset pair, then derive a distance matrix and call a
+match if **% identity ≥ 99 %**.
+
+To keep runtime bounded, alignments are restricted to ASVs that are **not** an
+exact match on the common prefix.
+
+```{r align-helper}
+identity_match <- function(seqs_a, seqs_b, ids_a, ids_b,
+                           min_identity = 0.99) {
+  if (length(seqs_a) == 0 || length(seqs_b) == 0)
+    return(data.frame(ASV_A = character(), ASV_B = character(),
+                      identity = numeric()))
+
+  # Build a single set; align once
+  all_seqs <- DNAStringSet(c(seqs_a, seqs_b))
+  names(all_seqs) <- c(paste0("A__", ids_a), paste0("B__", ids_b))
+
+  aln <- AlignSeqs(all_seqs, verbose = FALSE, processors = NULL)
+  d   <- DistanceMatrix(aln, type = "matrix",
+                        includeTerminalGaps = FALSE,
+                        penalizeGapLetterMatches = TRUE,
+                        verbose = FALSE)
+
+  is_a <- startsWith(rownames(d), "A__")
+  is_b <- startsWith(rownames(d), "B__")
+  sub  <- d[is_a, is_b, drop = FALSE]   # rows = A, cols = B; values = distance
+
+  # Nearest neighbour in B for each A
+  nn_idx  <- apply(sub, 1, which.min)
+  nn_dist <- apply(sub, 1, min)
+  identity <- 1 - nn_dist
+
+  res <- data.frame(
+    ASV_A    = sub("^A__", "", rownames(sub)),
+    ASV_B    = sub("^B__", "", colnames(sub)[nn_idx]),
+    identity = identity,
+    stringsAsFactors = FALSE
+  )
+  res[res$identity >= min_identity, ]
+}
+```
+
+```{r align-pairs}
+run_alignment_overlap <- function(a, b, min_id = 0.99, prefix_len = common_len) {
+  da <- asv_df %>% filter(Dataset == a)
+  db <- asv_df %>% filter(Dataset == b)
+
+  # Drop pairs already matched on common prefix
+  pa <- substr(da$Sequence, 1, prefix_len)
+  pb <- substr(db$Sequence, 1, prefix_len)
+
+  da_un <- da[!pa %in% pb, ]
+  db_un <- db[!pb %in% pa, ]
+
+  cat(sprintf("Aligning %s (%d unmatched) vs %s (%d unmatched)\n",
+              a, nrow(da_un), b, nrow(db_un)))
+
+  if (nrow(da_un) == 0 || nrow(db_un) == 0)
+    return(data.frame(A = a, B = b, ASV_A = character(),
+                      ASV_B = character(), identity = numeric()))
+
+  m <- identity_match(da_un$Sequence, db_un$Sequence,
+                      da_un$ASV_ID,   db_un$ASV_ID,
+                      min_identity = min_id)
+  if (nrow(m) == 0) return(data.frame(A = a, B = b,
+                                      ASV_A = character(),
+                                      ASV_B = character(),
+                                      identity = numeric()))
+  cbind(A = a, B = b, m)
+}
+
+pairs <- list(
+  c("MiSeq", "NextSeq_standard"),
+  c("MiSeq", "NextSeq_CustomBinned"),
+  c("NextSeq_standard", "NextSeq_CustomBinned")
+)
+
+align_hits <- bind_rows(lapply(pairs, function(pr)
+  run_alignment_overlap(pr[1], pr[2], min_id = 0.99)))
+
+write.csv(align_hits,
+          file.path(path_results, "META_007_alignment_overlap_99pct.csv"),
+          row.names = FALSE)
+
+head(align_hits)
+```
+
+## 6.1 Combined overlap summary (exact + near-match)
+
+```{r combined-overlap}
+combined_overlap <- lapply(pairs, function(pr) {
+  a <- pr[1]; b <- pr[2]
+  da <- asv_df %>% filter(Dataset == a) %>% pull(Sequence)
+  db <- asv_df %>% filter(Dataset == b) %>% pull(Sequence)
+
+  exact_full   <- length(intersect(unique(da), unique(db)))
+  exact_prefix <- length(intersect(unique(substr(da, 1, common_len)),
+                                   unique(substr(db, 1, common_len))))
+  near <- align_hits %>% filter(A == a, B == b) %>% nrow()
+
+  data.frame(A = a, B = b,
+             n_A_total          = length(da),
+             n_B_total          = length(db),
+             exact_full         = exact_full,
+             exact_prefix       = exact_prefix,
+             near_match_99pct   = near,
+             total_matched_99pct = exact_prefix + near)
+})
+combined_overlap <- bind_rows(combined_overlap)
+write.csv(combined_overlap,
+          file.path(path_results, "META_007_combined_overlap.csv"),
+          row.names = FALSE)
+combined_overlap
+```
+
+# 7. Identity Distribution of Near-Matches
+
+```{r identity-dist, fig.width=8, fig.height=4}
+if (nrow(align_hits) > 0) {
+  ggplot(align_hits, aes(identity, fill = paste(A, "vs", B))) +
+    geom_histogram(binwidth = 0.005, alpha = 0.7, position = "identity") +
+    facet_wrap(~ paste(A, "vs", B), nrow = 1) +
+    theme_bw() + theme(legend.position = "none") +
+    labs(title = "Identity of near-matched ASVs (≥ 99 %)",
+         x = "Identity", y = "Count")
+}
+```
+
+# 8. Are Shared ASVs the Abundant Ones?
+
+```{r shared-vs-abund, fig.width=10, fig.height=4}
+prefix_sets <- split(substr(asv_df$Sequence, 1, common_len), asv_df$Dataset)
+shared_prefix <- Reduce(intersect, prefix_sets)
+
+asv_df <- asv_df %>%
+  mutate(SharedAcrossAll = substr(Sequence, 1, common_len) %in% shared_prefix)
+
+ggplot(asv_df, aes(SharedAcrossAll, RelAbund + 1e-6, fill = Dataset)) +
+  geom_boxplot(alpha = 0.6, outlier.size = 0.6) +
+  facet_wrap(~ Dataset) +
+  scale_y_log10() +
+  theme_bw() + theme(legend.position = "none") +
+  labs(title = "Relative abundance of shared vs unique ASVs",
+       x = "Shared across all 3 datasets", y = "Relative abundance (log10)")
+
+asv_df %>%
+  group_by(Dataset, SharedAcrossAll) %>%
+  summarise(n = n(),
+            cum_relabund = sum(RelAbund),
+            .groups = "drop")
+```
+
+# 9. Save Annotated ASV Table
+
+```{r save-final}
+write.csv(asv_df %>% select(-Sequence),
+          file.path(path_results, "META_007_asv_annotated.csv"),
+          row.names = FALSE)
+```
+
+# Session Info
+
+```{r session}
+sessionInfo()
+```

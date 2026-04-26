@@ -1,0 +1,255 @@
+---
+title: "META_007 - Alpha Diversity: MiSeq vs NextSeq"
+author: "Genomics Platform"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+editor: visual
+execute:
+  warning: false
+  message: false
+---
+
+# Overview
+
+Comparison of **alpha diversity** estimates across the three phyloseq objects produced in `00_PreProcessing`:
+
+- `META_007_Miseq.rds` — MiSeq, standard DADA2 error model
+- `META_007_NextSeq_standard.rds` — NextSeq, standard `learnErrors`
+- `META_007_NextSeq_CustomBinned_DADA2.rds` — NextSeq, custom binned-Q `loessErrfun`
+
+The same biological samples were sequenced on both platforms. Differences in alpha diversity therefore reflect platform/error-model effects rather than biology, which is the point of this analysis.
+
+# 1. Setup
+
+```{r libraries}
+library(phyloseq)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggpubr)      # stat_compare_means / paired tests
+library(here)
+library(rstatix)     # tidy paired tests
+library(patchwork)
+```
+
+```{r paths}
+path_phyloseq <- here("data", "02_phyloseq")
+path_results  <- here("data", "03_alpha_diversity")
+dir.create(path_results, recursive = TRUE, showWarnings = FALSE)
+```
+
+# 2. Load phyloseq Objects
+
+```{r load-ps}
+ps_miseq    <- readRDS(file.path(path_phyloseq, "META_007_Miseq.rds"))
+ps_ns_std   <- readRDS(file.path(path_phyloseq, "META_007_NextSeq_standard.rds"))
+ps_ns_bin   <- readRDS(file.path(path_phyloseq,
+                                 "META_007_NextSeq_CustomBinned_DADA2.rds"))
+
+# Tag each object with a clear platform/model label (in case sample_data lacks it)
+sample_data(ps_miseq)$Dataset  <- "MiSeq"
+sample_data(ps_ns_std)$Dataset <- "NextSeq_standard"
+sample_data(ps_ns_bin)$Dataset <- "NextSeq_CustomBinned"
+
+ps_list <- list(
+  MiSeq                = ps_miseq,
+  NextSeq_standard     = ps_ns_std,
+  NextSeq_CustomBinned = ps_ns_bin
+)
+
+sapply(ps_list, function(x) c(nsamples = nsamples(x), ntaxa = ntaxa(x)))
+```
+
+# 3. Library-Size Overview
+
+Alpha diversity is sensitive to sequencing depth. Visualise depth per sample/dataset before any rarefaction.
+
+```{r libsize}
+libsize_df <- bind_rows(lapply(names(ps_list), function(n) {
+  data.frame(SampleID = sample_names(ps_list[[n]]),
+             Dataset  = n,
+             Depth    = sample_sums(ps_list[[n]]))
+}))
+
+ggplot(libsize_df, aes(Dataset, Depth, fill = Dataset)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = NA) +
+  geom_jitter(width = 0.15, size = 1.5, alpha = 0.7) +
+  scale_y_log10() +
+  theme_bw() +
+  labs(y = "Reads per sample (log10)", x = NULL,
+       title = "Library size per dataset")
+```
+
+# 4. Rarefaction to Common Depth
+
+To make alpha diversity comparable across datasets, rarefy each object to the
+**minimum sample depth across all three datasets** (or pick a sensible cutoff).
+
+```{r rarefy}
+min_depth <- min(unlist(lapply(ps_list, sample_sums)))
+cat("Rarefaction depth (min across datasets):", min_depth, "\n")
+
+set.seed(42)
+ps_list_rare <- lapply(ps_list, function(p) {
+  rarefy_even_depth(p, sample.size = min_depth,
+                    rngseed = 42, replace = FALSE,
+                    trimOTUs = TRUE, verbose = FALSE)
+})
+```
+
+# 5. Compute Alpha Diversity
+
+```{r alpha-compute}
+metrics <- c("Observed", "Chao1", "Shannon", "Simpson", "InvSimpson")
+
+alpha_df <- bind_rows(lapply(names(ps_list_rare), function(n) {
+  er <- estimate_richness(ps_list_rare[[n]], measures = metrics)
+  er$SampleID <- rownames(er)
+  er$Dataset  <- n
+  er
+}))
+
+# Long form for plotting / testing
+alpha_long <- alpha_df %>%
+  pivot_longer(cols = all_of(metrics),
+               names_to = "Metric", values_to = "Value")
+
+head(alpha_long)
+```
+
+```{r save-alpha}
+write.csv(alpha_df,
+          file.path(path_results, "META_007_alpha_diversity.csv"),
+          row.names = FALSE)
+```
+
+# 6. Visualisation
+
+## 6.1 Per-dataset distributions
+
+```{r alpha-boxplots, fig.width=10, fig.height=6}
+ggplot(alpha_long, aes(Dataset, Value, fill = Dataset)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = NA) +
+  geom_jitter(width = 0.15, size = 1.2, alpha = 0.7) +
+  facet_wrap(~ Metric, scales = "free_y") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        legend.position = "none") +
+  labs(x = NULL, y = "Alpha diversity",
+       title = "Alpha diversity across platforms / error models")
+```
+
+## 6.2 Paired view (same sample across datasets)
+
+Because the same samples appear in all three datasets, a paired plot is more
+informative than independent boxplots.
+
+```{r alpha-paired, fig.width=10, fig.height=6}
+ggplot(alpha_long, aes(Dataset, Value, group = SampleID)) +
+  geom_line(alpha = 0.4, colour = "grey40") +
+  geom_point(aes(colour = Dataset), size = 2) +
+  facet_wrap(~ Metric, scales = "free_y") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        legend.position = "none") +
+  labs(x = NULL, y = "Alpha diversity",
+       title = "Paired alpha diversity per sample")
+```
+
+# 7. Statistical Testing (Paired)
+
+Use Wilcoxon signed-rank tests on the three pairwise dataset contrasts, per
+metric. Only samples present in **both** datasets of a contrast are included.
+
+```{r paired-tests}
+contrasts <- list(
+  c("MiSeq", "NextSeq_standard"),
+  c("MiSeq", "NextSeq_CustomBinned"),
+  c("NextSeq_standard", "NextSeq_CustomBinned")
+)
+
+run_paired <- function(metric, a, b) {
+  d <- alpha_df %>%
+    filter(Dataset %in% c(a, b)) %>%
+    select(SampleID, Dataset, all_of(metric)) %>%
+    pivot_wider(names_from = Dataset, values_from = all_of(metric)) %>%
+    drop_na()
+  if (nrow(d) < 3) {
+    return(data.frame(Metric = metric, A = a, B = b,
+                      n = nrow(d), p = NA_real_,
+                      median_diff = NA_real_))
+  }
+  w <- wilcox.test(d[[a]], d[[b]], paired = TRUE, exact = FALSE)
+  data.frame(Metric = metric, A = a, B = b,
+             n = nrow(d), p = w$p.value,
+             median_diff = median(d[[a]] - d[[b]]))
+}
+
+stat_tbl <- do.call(rbind, lapply(metrics, function(m) {
+  do.call(rbind, lapply(contrasts, function(ct) run_paired(m, ct[1], ct[2])))
+}))
+
+stat_tbl <- stat_tbl %>%
+  group_by(Metric) %>%
+  mutate(p_adj = p.adjust(p, method = "BH")) %>%
+  ungroup() %>%
+  arrange(Metric, A, B)
+
+stat_tbl
+```
+
+```{r save-stats}
+write.csv(stat_tbl,
+          file.path(path_results, "META_007_alpha_paired_tests.csv"),
+          row.names = FALSE)
+```
+
+# 8. Per-Sample Concordance
+
+Scatter plots of the same metric across pairs of datasets — points on the
+diagonal indicate perfect agreement.
+
+```{r concordance, fig.width=10, fig.height=10}
+make_scatter <- function(metric, a, b) {
+  d <- alpha_df %>%
+    filter(Dataset %in% c(a, b)) %>%
+    select(SampleID, Dataset, all_of(metric)) %>%
+    pivot_wider(names_from = Dataset, values_from = all_of(metric))
+  ggplot(d, aes(.data[[a]], .data[[b]])) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "grey50") +
+    geom_point(size = 2, alpha = 0.8) +
+    theme_bw() +
+    labs(title = paste0(metric, ": ", a, " vs ", b),
+         x = a, y = b)
+}
+
+plots <- lapply(metrics, function(m) {
+  (make_scatter(m, "MiSeq", "NextSeq_standard") |
+     make_scatter(m, "MiSeq", "NextSeq_CustomBinned") |
+     make_scatter(m, "NextSeq_standard", "NextSeq_CustomBinned"))
+})
+wrap_plots(plots, ncol = 1)
+```
+
+# 9. Summary
+
+```{r summary-table}
+alpha_long %>%
+  group_by(Dataset, Metric) %>%
+  summarise(median = median(Value, na.rm = TRUE),
+            mean   = mean(Value, na.rm = TRUE),
+            sd     = sd(Value, na.rm = TRUE),
+            .groups = "drop") %>%
+  arrange(Metric, Dataset)
+```
+
+# Session Info
+
+```{r session}
+sessionInfo()
+```

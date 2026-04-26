@@ -1,0 +1,198 @@
+---
+title: "META_007 - 16S Amplicon PreProcessing (MiSeq)"
+author: "Genomics Platform"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+editor: visual
+execute:
+  warning: false
+  message: false
+---
+
+# Overview
+
+PreProcessing of 16S rRNA amplicon sequencing data generated on **Illumina MiSeq**, as part of the META_007 platform comparison (MiSeq vs NextSeq).
+
+The workflow follows the standard `DADA2` pipeline, with one project-specific addition: the truncation positions used in `filterAndTrim()` are chosen based on the position at which the **majority of samples drop below Q20** for forward and reverse reads.
+
+# 1. Setup
+
+```{r libraries}
+library(dada2)
+library(phyloseq)
+library(Biostrings)
+library(ggplot2)
+library(here)
+```
+
+```{r paths}
+# Adjust raw FASTQ folder as needed
+path_raw      <- here("data", "01_raw", "MiSeq")
+path_filt     <- here("data", "02_filtered", "MiSeq")
+path_phyloseq <- here("data", "02_phyloseq")
+path_tax      <- here("data", "98_miscellaneous", "silva")  # SILVA reference
+
+dir.create(path_filt, recursive = TRUE, showWarnings = FALSE)
+dir.create(path_phyloseq, recursive = TRUE, showWarnings = FALSE)
+
+# Forward / reverse files (Illumina convention)
+fnFs <- sort(list.files(path_raw, pattern = "_R1_001.fastq.gz", full.names = TRUE))
+fnRs <- sort(list.files(path_raw, pattern = "_R2_001.fastq.gz", full.names = TRUE))
+
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+sample.names
+```
+
+# 2. Quality Profiles
+
+```{r qc-plots}
+plotQualityProfile(fnFs[1:min(4, length(fnFs))]) + ggtitle("Forward — first samples")
+plotQualityProfile(fnRs[1:min(4, length(fnRs))]) + ggtitle("Reverse — first samples")
+```
+
+## 2.1 Find truncation length where the majority of samples drop below Q20
+
+We compute, per cycle position, the median quality across reads for each sample, then identify the **first position where the median quality drops below 20** in the majority (>50%) of samples. That position is used as `truncLen` for forward and reverse.
+
+```{r q20-detection}
+# Helper: returns a vector of "first position < Q20" per sample
+first_below_q20 <- function(fastq_files, q_threshold = 20) {
+  sapply(fastq_files, function(f) {
+    qp <- ShortRead::qa(f)[["perCycle"]][["quality"]]
+    # Compute mean quality per cycle (weighted by Count)
+    agg <- aggregate(Score * Count ~ Cycle, data = qp, FUN = sum)
+    cnt <- aggregate(Count ~ Cycle, data = qp, FUN = sum)
+    mean_q <- agg[, 2] / cnt[, 2]
+    cycles <- agg$Cycle
+    below  <- which(mean_q < q_threshold)
+    if (length(below) == 0) max(cycles) else min(cycles[below])
+  })
+}
+
+posF <- first_below_q20(fnFs, q_threshold = 20)
+posR <- first_below_q20(fnRs, q_threshold = 20)
+
+# Use the position where the MAJORITY of samples have already crossed below Q20.
+# Equivalent to the median of per-sample first-below-Q20 positions.
+truncLen_F <- as.integer(median(posF))
+truncLen_R <- as.integer(median(posR))
+
+cat("Forward truncLen (median of first-below-Q20):", truncLen_F, "\n")
+cat("Reverse truncLen (median of first-below-Q20):", truncLen_R, "\n")
+```
+
+# 3. Filter and Trim
+
+```{r filter-trim}
+filtFs <- file.path(path_filt, paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path_filt, paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+out <- filterAndTrim(
+  fnFs, filtFs, fnRs, filtRs,
+  truncLen = c(truncLen_F, truncLen_R),
+  maxN = 0, maxEE = c(2, 2), truncQ = 2, rm.phix = TRUE,
+  compress = TRUE, multithread = TRUE
+)
+head(out)
+```
+
+# 4. Learn Errors
+
+```{r learn-errors}
+errF <- learnErrors(filtFs, multithread = TRUE)
+errR <- learnErrors(filtRs, multithread = TRUE)
+
+plotErrors(errF, nominalQ = TRUE)
+plotErrors(errR, nominalQ = TRUE)
+```
+
+# 5. DADA2 Inference
+
+```{r dada}
+dadaFs <- dada(filtFs, err = errF, multithread = TRUE)
+dadaRs <- dada(filtRs, err = errR, multithread = TRUE)
+```
+
+# 6. Merge Pairs and Build Sequence Table
+
+```{r merge-seqtab}
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose = TRUE)
+seqtab  <- makeSequenceTable(mergers)
+table(nchar(getSequences(seqtab)))
+```
+
+# 7. Remove Chimeras
+
+```{r chimera}
+seqtab.nochim <- removeBimeraDenovo(
+  seqtab, method = "consensus", multithread = TRUE, verbose = TRUE
+)
+sum(seqtab.nochim) / sum(seqtab)
+```
+
+# 8. Track Reads Through the Pipeline
+
+```{r track}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out,
+               sapply(dadaFs, getN), sapply(dadaRs, getN),
+               sapply(mergers, getN), rowSums(seqtab.nochim))
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR",
+                     "merged", "nonchim")
+rownames(track) <- sample.names
+track
+```
+
+# 9. Taxonomic Classification (SILVA)
+
+```{r taxonomy}
+taxa <- assignTaxonomy(
+  seqtab.nochim,
+  file.path(path_tax, "silva_nr99_v138.1_train_set.fa.gz"),
+  multithread = TRUE
+)
+taxa <- addSpecies(
+  taxa,
+  file.path(path_tax, "silva_species_assignment_v138.1.fa.gz")
+)
+head(taxa)
+```
+
+# 10. Build phyloseq Object
+
+```{r phyloseq}
+otu <- otu_table(seqtab.nochim, taxa_are_rows = FALSE)
+tax <- tax_table(taxa)
+sam <- sample_data(data.frame(SampleID = sample.names,
+                              Platform = "MiSeq",
+                              row.names = sample.names))
+
+ps <- phyloseq(otu, tax, sam)
+
+# Replace ASV sequences in taxa_names by short IDs and store sequences
+dna <- DNAStringSet(taxa_names(ps))
+names(dna) <- taxa_names(ps)
+ps <- merge_phyloseq(ps, dna)
+taxa_names(ps) <- paste0("ASV", seq(ntaxa(ps)))
+
+ps
+```
+
+# 11. Save phyloseq Object
+
+```{r save-rds}
+saveRDS(ps, file = file.path(path_phyloseq, "META_007_Miseq.rds"))
+```
+
+# Session Info
+
+```{r session}
+sessionInfo()
+```
